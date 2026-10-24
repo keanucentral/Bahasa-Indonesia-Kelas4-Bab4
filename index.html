@@ -998,73 +998,32 @@
             }
         }
 
-        // ==================== FITUR SUARA AI MURNI (KHUSUS SMARTPHONE & DESKTOP) ====================
+        // ==================== FITUR SUARA AI MURNI (WEB AUDIO API KHUSUS SMARTPHONE) ====================
         let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
-        const ttsAudioCache = {}; // Menyimpan data WAV Blob agar bebas blokir di HP
-        const pendingFetches = {}; // Mencegah request ganda untuk teks yang sama
+        const ttsAudioCache = {}; // Menyimpan data AudioBuffer murni agar langsung bisa diputar
+        const pendingFetches = {}; 
         let activeRequestId = 0;
 
-        let ttsAudioElement = null;
+        let ttsAudioCtx = null;
+        let currentTtsSource = null;
 
-        // Inisialisasi Audio Element harus dipanggil seketika saat tombol disentuh!
-        function initTtsAudioElement() {
-            if (!ttsAudioElement) {
-                ttsAudioElement = new Audio();
-                // Trik "Unlock" khusus untuk iOS Safari dan Chrome Android
-                // Memutar WAV diam/siluman agar browser mengizinkan pemutaran via JavaScript
-                ttsAudioElement.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-                ttsAudioElement.play().catch(e => console.log('Unlock pending:', e));
+        // Buka kunci AudioContext tepat pada milidetik saat layar diketuk
+        function initTtsAudio() {
+            if (!ttsAudioCtx) {
+                ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
             }
-        }
-
-        // FUNGSI KONVERSI CEPAT (ANTI-CRASH UNTUK SMARTPHONE)
-        async function createWavUrlFast(base64Audio, sampleRate) {
-            // 1. Decode Base64 secepat kilat menggunakan Native Fetch (Mencegah memori HP kepenuhan karena atob)
-            const res = await fetch(`data:application/octet-stream;base64,${base64Audio}`);
-            const pcmBuffer = await res.arrayBuffer();
-            
-            // 2. Pastikan ukuran buffer genap (16-bit / 2 byte per sampel)
-            const validLength = pcmBuffer.byteLength - (pcmBuffer.byteLength % 2);
-            const safePcmBuffer = pcmBuffer.slice(0, validLength);
-            
-            // 3. Buat Header WAV (44 Byte)
-            const header = new ArrayBuffer(44);
-            const view = new DataView(header);
-            
-            const writeString = (offset, string) => {
-                for (let i = 0; i < string.length; i++) {
-                    view.setUint8(offset + i, string.charCodeAt(i));
-                }
-            };
-            
-            const numChannels = 1;
-            const byteRate = sampleRate * numChannels * 2;
-            const blockAlign = numChannels * 2;
-            
-            writeString(0, 'RIFF');
-            view.setUint32(4, 36 + validLength, true);
-            writeString(8, 'WAVE');
-            writeString(12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, 1, true); // PCM format
-            view.setUint16(22, numChannels, true);
-            view.setUint32(24, sampleRate, true);
-            view.setUint32(28, byteRate, true);
-            view.setUint16(32, blockAlign, true);
-            view.setUint16(34, 16, true); // 16-bit
-            writeString(36, 'data');
-            view.setUint32(40, validLength, true);
-            
-            // 4. Gabungkan Header dan Data PCM secara instan (O(1) tanpa loop JS berat)
-            const wavBlob = new Blob([header, safePcmBuffer], { type: 'audio/wav' });
-            return URL.createObjectURL(wavBlob);
+            if (ttsAudioCtx.state === 'suspended') {
+                ttsAudioCtx.resume();
+            }
         }
 
         function stopActiveSpeech() {
             activeRequestId++;
-            if (ttsAudioElement) {
-                ttsAudioElement.pause();
-                ttsAudioElement.currentTime = 0;
+            if (currentTtsSource) {
+                try { 
+                    currentTtsSource.stop(); 
+                } catch(e) {}
+                currentTtsSource = null;
             }
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
@@ -1097,7 +1056,7 @@
             }
         }
 
-        // Fungsi pengambil suara AI Gemini TTS
+        // Fungsi pengambil suara AI & Konversi langsung ke Web Audio Buffer
         async function fetchGeminiTtsData(text, character) {
             const cacheKey = `${character}:${text}`;
             if (ttsAudioCache[cacheKey]) return ttsAudioCache[cacheKey];
@@ -1137,7 +1096,7 @@
 
                         if (!response.ok) {
                             const errTxt = await response.text();
-                            throw new Error(`HTTP ${response.status}: ${errTxt}`);
+                            throw new Error(`HTTP Error`);
                         }
 
                         const result = await response.json();
@@ -1145,7 +1104,7 @@
                         const audioPart = parts.find(p => p.inlineData && p.inlineData.data);
                         
                         if (!audioPart || !audioPart.inlineData) {
-                            throw new Error('Audio data kosong atau struktur API berubah.');
+                            throw new Error('Data audio kosong.');
                         }
                         
                         const audioData = audioPart.inlineData.data;
@@ -1154,13 +1113,24 @@
                         const rateMatch = mimeType.match(/rate=(\d+)/);
                         const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
                         
-                        // Konversi audio dengan metode cepat anti-crash
-                        const audioUrl = await createWavUrlFast(audioData, sampleRate);
-                        const audioObj = { url: audioUrl };
+                        // 1. Ekstrak Base64 ke ArrayBuffer secara instan (menggunakan Native Fetch, bebas crash RAM)
+                        initTtsAudio();
+                        const res = await fetch(`data:application/octet-stream;base64,${audioData}`);
+                        const arrayBuffer = await res.arrayBuffer();
+                        
+                        // 2. Decode raw PCM 16-bit menjadi AudioBuffer (Gelombang Frekuensi)
+                        const int16Data = new Int16Array(arrayBuffer);
+                        const audioBuffer = ttsAudioCtx.createBuffer(1, int16Data.length, sampleRate);
+                        const float32Data = audioBuffer.getChannelData(0);
+                        
+                        for (let i = 0; i < int16Data.length; i++) {
+                            float32Data[i] = int16Data[i] / 32768.0; 
+                        }
 
-                        ttsAudioCache[cacheKey] = audioObj;
+                        // Simpan hasil frekuensi langsung ke cache
+                        ttsAudioCache[cacheKey] = audioBuffer;
                         delete pendingFetches[cacheKey];
-                        return audioObj;
+                        return audioBuffer;
                         
                     } catch (err) {
                         lastErr = err;
@@ -1179,45 +1149,40 @@
         }
 
         async function speakText(text) {
-            initTtsAudioElement(); // Panggil segera saat diklik agar HP mengizinkan pemutaran
+            initTtsAudio(); // Wajib di-unlock sinkron tepat saat diketuk
             stopActiveSpeech();
             const myRequestId = ++activeRequestId;
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
 
             try {
-                let audioObj = ttsAudioCache[cacheKey];
+                let audioBuffer = ttsAudioCache[cacheKey];
                 
-                // Jika belum ada di cache, tampilkan loading dan ambil dari API
-                if (!audioObj) {
+                if (!audioBuffer) {
                     const isChild = selectedVoiceCharacter === 'child';
-                    const statusLabel = isChild
-                        ? '👧 Menyiapkan suara AI Teman Cilik...'
-                        : '👩‍🏫 Menyiapkan suara AI Ibu Guru...';
-                    setTtsStatus(true, statusLabel, false);
+                    setTtsStatus(true, isChild ? '👧 Menyiapkan suara AI Teman Cilik...' : '👩‍🏫 Menyiapkan suara AI Ibu Guru...', false);
 
-                    audioObj = await fetchGeminiTtsData(text, selectedVoiceCharacter);
-                    if (myRequestId !== activeRequestId) return; // Dibatalkan oleh klik baru
+                    audioBuffer = await fetchGeminiTtsData(text, selectedVoiceCharacter);
+                    if (myRequestId !== activeRequestId) return;
                 }
 
                 setTtsStatus(false);
 
-                // Putar menggunakan elemen <audio> standar yang terbukti stabil di semua perangkat
-                ttsAudioElement.src = audioObj.url;
-                ttsAudioElement.playbackRate = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
-                ttsAudioElement.load(); // Paksa muat data untuk Safari / Android lama
-                
-                try {
-                    await ttsAudioElement.play();
-                } catch (playErr) {
-                    console.error("Audio playback error:", playErr);
-                    setTtsStatus(true, '⚠️ Tap sekali lagi untuk mengizinkan suara keluar.', true);
-                    setTimeout(() => setTtsStatus(false), 3000);
+                // Mainkan frekuensi suara (Ponsel tidak bisa memblokir metode ini walau proses async tertunda)
+                currentTtsSource = ttsAudioCtx.createBufferSource();
+                currentTtsSource.buffer = audioBuffer;
+                currentTtsSource.playbackRate.value = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
+                currentTtsSource.connect(ttsAudioCtx.destination);
+                currentTtsSource.start(0);
+
+                // Pengaman ekstra untuk Safari iOS (Kadang context otomatis tertidur ulang)
+                if (ttsAudioCtx.state === 'suspended') {
+                    await ttsAudioCtx.resume();
                 }
 
             } catch (err) {
                 if (myRequestId !== activeRequestId) return;
                 console.error("AI Audio Error:", err);
-                setTtsStatus(true, '⚠️ Gagal memuat suara. Coba klik lagi dalam beberapa detik.', true);
+                setTtsStatus(true, '⚠️ Gagal memuat suara. Ketuk tombol sekali lagi.', true);
                 setTimeout(() => setTtsStatus(false), 4000);
             }
         }
