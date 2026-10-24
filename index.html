@@ -1006,14 +1006,61 @@
 
         let ttsAudioCtx = null;
         let currentTtsSource = null;
+        let isAudioUnlocked = false; // Penanda apakah sirkuit audio sudah terbuka
 
-        // Buka kunci AudioContext tepat pada milidetik saat layar diketuk
+        // Fungsi Super Ringan (Anti-Crash) untuk memecahkan sandi suara AI di memori HP
+        function decodeBase64ToFloat32(base64Str) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            const lookup = new Uint8Array(256);
+            for (let i = 0; i < chars.length; i++) { lookup[chars.charCodeAt(i)] = i; }
+
+            // Hitung panjang byte
+            let bufferLength = base64Str.length * 0.75;
+            if (base64Str[base64Str.length - 1] === '=') bufferLength--;
+            if (base64Str[base64Str.length - 2] === '=') bufferLength--;
+
+            const arrayBuffer = new ArrayBuffer(bufferLength);
+            const bytes = new Uint8Array(arrayBuffer);
+
+            let p = 0;
+            for (let i = 0; i < base64Str.length; i += 4) {
+                let encoded1 = lookup[base64Str.charCodeAt(i)];
+                let encoded2 = lookup[base64Str.charCodeAt(i + 1)];
+                let encoded3 = lookup[base64Str.charCodeAt(i + 2)];
+                let encoded4 = lookup[base64Str.charCodeAt(i + 3)];
+
+                bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+                if (encoded3 !== 64 && p < bufferLength) {
+                    bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+                }
+                if (encoded4 !== 64 && p < bufferLength) {
+                    bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+                }
+            }
+
+            // Ubah dari PCM 16-bit (Int16) menjadi Gelombang Frekuensi (Float32) untuk Web Audio
+            const int16Data = new Int16Array(arrayBuffer);
+            const float32Data = new Float32Array(int16Data.length);
+            for (let i = 0; i < int16Data.length; i++) {
+                float32Data[i] = int16Data[i] / 32768.0; 
+            }
+            return float32Data;
+        }
+
+        // Buka kunci AudioContext dengan suara 'Hening' (Wajib dipanggil SINKRON saat layar disentuh)
         function initTtsAudio() {
             if (!ttsAudioCtx) {
                 ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
             }
-            if (ttsAudioCtx.state === 'suspended') {
+            if (!isAudioUnlocked || ttsAudioCtx.state === 'suspended') {
                 ttsAudioCtx.resume();
+                // Trik "Suara Hening" untuk memaksa browser iOS/Android membuka kunci speaker
+                const silentBuffer = ttsAudioCtx.createBuffer(1, 1, 22050);
+                const silentSource = ttsAudioCtx.createBufferSource();
+                silentSource.buffer = silentBuffer;
+                silentSource.connect(ttsAudioCtx.destination);
+                silentSource.start(0);
+                isAudioUnlocked = true;
             }
         }
 
@@ -1113,19 +1160,15 @@
                         const rateMatch = mimeType.match(/rate=(\d+)/);
                         const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
                         
-                        // 1. Ekstrak Base64 ke ArrayBuffer secara instan (menggunakan Native Fetch, bebas crash RAM)
+                        // 1. Pastikan AudioContext siap
                         initTtsAudio();
-                        const res = await fetch(`data:application/octet-stream;base64,${audioData}`);
-                        const arrayBuffer = await res.arrayBuffer();
                         
-                        // 2. Decode raw PCM 16-bit menjadi AudioBuffer (Gelombang Frekuensi)
-                        const int16Data = new Int16Array(arrayBuffer);
-                        const audioBuffer = ttsAudioCtx.createBuffer(1, int16Data.length, sampleRate);
-                        const float32Data = audioBuffer.getChannelData(0);
+                        // 2. Decode Base64 ke Float32 secara manual (Super Ringan Anti-Crash RAM HP)
+                        const float32Data = decodeBase64ToFloat32(audioData);
                         
-                        for (let i = 0; i < int16Data.length; i++) {
-                            float32Data[i] = int16Data[i] / 32768.0; 
-                        }
+                        // 3. Buat AudioBuffer resmi
+                        const audioBuffer = ttsAudioCtx.createBuffer(1, float32Data.length, sampleRate);
+                        audioBuffer.copyToChannel(float32Data, 0);
 
                         // Simpan hasil frekuensi langsung ke cache
                         ttsAudioCache[cacheKey] = audioBuffer;
