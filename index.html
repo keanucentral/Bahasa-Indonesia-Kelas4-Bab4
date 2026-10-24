@@ -1066,26 +1066,41 @@
             }
         }
 
-        function fallbackBrowserSpeech(text) {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-                const utterance = new SpeechSynthesisUtterance(text);
-                utterance.lang = 'id-ID';
-                const voices = window.speechSynthesis.getVoices();
-                // Cari suara Bahasa Indonesia (prioritaskan suara wanita seperti Gadis / Google Bahasa Indonesia)
-                const idVoice = voices.find(v => v.lang.includes('id') && (v.name.toLowerCase().includes('female') || v.name.toLowerCase().includes('gadis') || v.name.toLowerCase().includes('google'))) 
-                             || voices.find(v => v.lang.includes('id'));
-                if (idVoice) utterance.voice = idVoice;
-
-                if (selectedVoiceCharacter === 'child') {
-                    utterance.pitch = 1.55; // Nada tinggi menyerupai suara anak-anak
-                    utterance.rate = 1.05;
-                } else {
-                    utterance.pitch = 1.15; // Nada suara wanita dewasa yang ramah
-                    utterance.rate = 0.95;
-                }
-                window.speechSynthesis.speak(utterance);
+        function fallbackBrowserSpeech(text, attempt = 0) {
+            if (!('speechSynthesis' in window)) return;
+            
+            const voices = window.speechSynthesis.getVoices();
+            
+            // Perbaikan untuk Mobile: Browser di HP sering terlambat memuat daftar suara.
+            // Kita tunggu hingga suaranya tersedia (maksimal coba 10 kali / 2 detik).
+            if (voices.length === 0 && attempt < 10) {
+                setTimeout(() => fallbackBrowserSpeech(text, attempt + 1), 200);
+                return;
             }
+
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'id-ID';
+            
+            // Pencarian suara yang lebih luas untuk iOS (Damayanti) dan Android (Google)
+            const idVoice = voices.find(v => v.lang.replace('_', '-').toLowerCase().includes('id') && 
+                            (v.name.toLowerCase().includes('female') || 
+                             v.name.toLowerCase().includes('gadis') || 
+                             v.name.toLowerCase().includes('damayanti') || 
+                             v.name.toLowerCase().includes('google'))) 
+                         || voices.find(v => v.lang.replace('_', '-').toLowerCase().includes('id'));
+                         
+            if (idVoice) utterance.voice = idVoice;
+
+            if (selectedVoiceCharacter === 'child') {
+                utterance.pitch = 1.6; // Nada lebih tinggi agar terdengar seperti anak kecil
+                utterance.rate = 1.05;
+            } else {
+                utterance.pitch = 1.1; // Nada wanita dewasa yang ramah
+                utterance.rate = 0.95;
+            }
+            
+            window.speechSynthesis.speak(utterance);
         }
 
         async function speakText(text) {
@@ -1093,16 +1108,18 @@
             // Hentikan audio sebelumnya jika sedang berjalan
             if (currentAudioPlayer) {
                 currentAudioPlayer.pause();
-                currentAudioPlayer = null;
+            } else {
+                currentAudioPlayer = new Audio(); // Inisialisasi awal untuk menghindari pemblokiran di Mobile
             }
+            
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
             }
 
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
             if (ttsAudioCache[cacheKey]) {
-                currentAudioPlayer = new Audio(ttsAudioCache[cacheKey]);
-                currentAudioPlayer.play();
+                currentAudioPlayer.src = ttsAudioCache[cacheKey];
+                currentAudioPlayer.play().catch(() => fallbackBrowserSpeech(text));
                 return;
             }
 
@@ -1163,8 +1180,11 @@
 
                     ttsAudioCache[cacheKey] = audioUrl;
                     setTtsStatus(false);
-                    currentAudioPlayer = new Audio(audioUrl);
-                    currentAudioPlayer.play();
+                    currentAudioPlayer.src = audioUrl;
+                    currentAudioPlayer.play().catch((err) => {
+                        // Jika mobile browser memblokir audio (karena policy autoplay), gunakan suara cadangan
+                        fallbackBrowserSpeech(text);
+                    });
                 } else {
                     throw new Error('Invalid audio format');
                 }
