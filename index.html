@@ -998,79 +998,86 @@
             }
         }
 
-        // ==================== FITUR SUARA AI MURNI (WEB AUDIO API KHUSUS SMARTPHONE) ====================
+        // ==================== FITUR SUARA AI (ANTI-CRASH & KOMPATIBEL PENUH DI SMARTPHONE) ====================
         let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
-        const ttsAudioCache = {}; // Menyimpan data AudioBuffer murni agar langsung bisa diputar
+        const ttsRawPcmCache = {}; // Menyimpan data Float32 murni (tanpa perlu AudioContext saat preload!)
+        const ttsWavUrlCache = {}; // Menyimpan URL WAV untuk pemutar HTML5 Audio di HP
         const pendingFetches = {}; 
         let activeRequestId = 0;
 
-        let ttsAudioCtx = null;
-        let currentTtsSource = null;
-        let isAudioUnlocked = false; // Penanda apakah sirkuit audio sudah terbuka
+        let currentHtmlAudio = null;
+        let currentWebAudioSource = null;
 
-        // Fungsi Super Ringan (Anti-Crash) untuk memecahkan sandi suara AI di memori HP
-        function decodeBase64ToFloat32(base64Str) {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-            const lookup = new Uint8Array(256);
-            for (let i = 0; i < chars.length; i++) { lookup[chars.charCodeAt(i)] = i; }
-
-            // Hitung panjang byte
-            let bufferLength = base64Str.length * 0.75;
-            if (base64Str[base64Str.length - 1] === '=') bufferLength--;
-            if (base64Str[base64Str.length - 2] === '=') bufferLength--;
-
-            const arrayBuffer = new ArrayBuffer(bufferLength);
-            const bytes = new Uint8Array(arrayBuffer);
-
-            let p = 0;
-            for (let i = 0; i < base64Str.length; i += 4) {
-                let encoded1 = lookup[base64Str.charCodeAt(i)];
-                let encoded2 = lookup[base64Str.charCodeAt(i + 1)];
-                let encoded3 = lookup[base64Str.charCodeAt(i + 2)];
-                let encoded4 = lookup[base64Str.charCodeAt(i + 3)];
-
-                bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
-                if (encoded3 !== 64 && p < bufferLength) {
-                    bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
-                }
-                if (encoded4 !== 64 && p < bufferLength) {
-                    bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
-                }
+        // 1. Konversi Base64 PCM16 menjadi Float32Array & WAV Blob dengan Aman (Genap/Ganjil Anti-Crash)
+        function processBase64Pcm(base64Str, sampleRate) {
+            // Bersihkan spasi atau baris baru dari base64
+            const cleanBase64 = base64Str.replace(/[\r\n\s]+/g, '');
+            const binaryStr = window.atob(cleanBase64);
+            // WAJIB GENAP: Int16 butuh kelipatan 2 byte. Jika ganjil, kurangi 1 byte agar tidak RangeError di HP!
+            const evenByteLength = binaryStr.length - (binaryStr.length % 2);
+            const pcmBytes = new Uint8Array(evenByteLength);
+            for (let i = 0; i < evenByteLength; i++) {
+                pcmBytes[i] = binaryStr.charCodeAt(i);
             }
 
-            // Ubah dari PCM 16-bit (Int16) menjadi Gelombang Frekuensi (Float32) untuk Web Audio
-            const int16Data = new Int16Array(arrayBuffer);
-            const float32Data = new Float32Array(int16Data.length);
-            for (let i = 0; i < int16Data.length; i++) {
-                float32Data[i] = int16Data[i] / 32768.0; 
+            // Buat Float32Array untuk Web Audio API (membaca Little-Endian 16-bit secara aman dengan DataView)
+            const numSamples = evenByteLength / 2;
+            const float32Data = new Float32Array(numSamples);
+            const pcmDataView = new DataView(pcmBytes.buffer);
+            for (let i = 0; i < numSamples; i++) {
+                const int16Sample = pcmDataView.getInt16(i * 2, true);
+                float32Data[i] = int16Sample / 32768.0;
             }
-            return float32Data;
+
+            // Buat juga WAV Blob URL agar bisa diputar lewat elemen <audio> standar di HP
+            const wavHeader = new ArrayBuffer(44);
+            const view = new DataView(wavHeader);
+            const writeStr = (offset, str) => {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            };
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + evenByteLength, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM = 1
+            view.setUint16(22, 1, true); // Mono = 1 channel
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeStr(36, 'data');
+            view.setUint32(40, evenByteLength, true);
+
+            const wavBlob = new Blob([wavHeader, pcmBytes], { type: 'audio/wav' });
+            const wavUrl = URL.createObjectURL(wavBlob);
+
+            return { float32Data, sampleRate, wavUrl };
         }
 
-        // Buka kunci AudioContext dengan suara 'Hening' (Wajib dipanggil SINKRON saat layar disentuh)
-        function initTtsAudio() {
-            if (!ttsAudioCtx) {
-                ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // Ambil AudioContext tunggal (Gunakan milik Tone.js agar tidak bentrok 2 AudioContext di HP)
+        function getSharedAudioContext() {
+            if (window.Tone && Tone.context && Tone.context.rawContext) {
+                return Tone.context.rawContext._nativeAudioContext || Tone.context.rawContext;
             }
-            if (!isAudioUnlocked || ttsAudioCtx.state === 'suspended') {
-                ttsAudioCtx.resume();
-                // Trik "Suara Hening" untuk memaksa browser iOS/Android membuka kunci speaker
-                const silentBuffer = ttsAudioCtx.createBuffer(1, 1, 22050);
-                const silentSource = ttsAudioCtx.createBufferSource();
-                silentSource.buffer = silentBuffer;
-                silentSource.connect(ttsAudioCtx.destination);
-                silentSource.start(0);
-                isAudioUnlocked = true;
+            if (!window._sharedTtsCtx) {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                window._sharedTtsCtx = new AudioCtx();
             }
+            return window._sharedTtsCtx;
         }
 
         function stopActiveSpeech() {
             activeRequestId++;
-            if (currentTtsSource) {
-                try { 
-                    currentTtsSource.stop(); 
-                } catch(e) {}
-                currentTtsSource = null;
+            if (currentWebAudioSource) {
+                try { currentWebAudioSource.stop(); } catch (e) {}
+                currentWebAudioSource = null;
+            }
+            if (currentHtmlAudio) {
+                try {
+                    currentHtmlAudio.pause();
+                    currentHtmlAudio.currentTime = 0;
+                } catch (e) {}
             }
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
@@ -1094,7 +1101,7 @@
             if (!bar || !txt) return;
             if (visible) {
                 bar.className = isError
-                    ? "bg-rose-500 text-white text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2"
+                    ? "bg-amber-500 text-white text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2"
                     : "bg-amber-300 text-slate-900 text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2";
                 txt.textContent = message;
                 bar.classList.remove('hidden');
@@ -1103,10 +1110,10 @@
             }
         }
 
-        // Fungsi pengambil suara AI & Konversi langsung ke Web Audio Buffer
+        // Fungsi Pengambil Suara AI (TANPA menyentuh AudioContext agar preload di HP 100% sukses!)
         async function fetchGeminiTtsData(text, character) {
             const cacheKey = `${character}:${text}`;
-            if (ttsAudioCache[cacheKey]) return ttsAudioCache[cacheKey];
+            if (ttsRawPcmCache[cacheKey]) return ttsRawPcmCache[cacheKey];
             if (pendingFetches[cacheKey]) return pendingFetches[cacheKey];
 
             const isChild = character === 'child';
@@ -1126,11 +1133,12 @@
                             prebuiltVoiceConfig: { voiceName: voiceName }
                         }
                     }
-                }
+                },
+                model: "gemini-2.5-flash-preview-tts"
             };
 
             const fetchPromise = (async () => {
-                const delays = [1000, 2000, 3000];
+                const delays = [800, 1600];
                 let lastErr = null;
 
                 for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -1142,8 +1150,7 @@
                         });
 
                         if (!response.ok) {
-                            const errTxt = await response.text();
-                            throw new Error(`HTTP Error`);
+                            throw new Error(`HTTP ${response.status}`);
                         }
 
                         const result = await response.json();
@@ -1151,33 +1158,23 @@
                         const audioPart = parts.find(p => p.inlineData && p.inlineData.data);
                         
                         if (!audioPart || !audioPart.inlineData) {
-                            throw new Error('Data audio kosong.');
+                            throw new Error('Data audio kosong');
                         }
                         
                         const audioData = audioPart.inlineData.data;
                         const mimeType = audioPart.inlineData.mimeType || "audio/L16;rate=24000";
-
                         const rateMatch = mimeType.match(/rate=(\d+)/);
                         const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
                         
-                        // 1. Pastikan AudioContext siap
-                        initTtsAudio();
-                        
-                        // 2. Decode Base64 ke Float32 secara manual (Super Ringan Anti-Crash RAM HP)
-                        const float32Data = decodeBase64ToFloat32(audioData);
-                        
-                        // 3. Buat AudioBuffer resmi
-                        const audioBuffer = ttsAudioCtx.createBuffer(1, float32Data.length, sampleRate);
-                        audioBuffer.copyToChannel(float32Data, 0);
-
-                        // Simpan hasil frekuensi langsung ke cache
-                        ttsAudioCache[cacheKey] = audioBuffer;
+                        // Proses menjadi Float32 & WAV tanpa menyentuh AudioContext sama sekali
+                        const processed = processBase64Pcm(audioData, sampleRate);
+                        ttsRawPcmCache[cacheKey] = processed;
+                        ttsWavUrlCache[cacheKey] = processed.wavUrl;
                         delete pendingFetches[cacheKey];
-                        return audioBuffer;
+                        return processed;
                         
                     } catch (err) {
                         lastErr = err;
-                        console.warn("AI Voice Fetch Retry:", attempt, err);
                         if (attempt < delays.length) {
                             await new Promise(r => setTimeout(r, delays[attempt]));
                         }
@@ -1191,46 +1188,96 @@
             return fetchPromise;
         }
 
+        // Cadangan Suara Browser yang Disesuaikan Karakter (Jika di WebView HP API Google Diblokir)
+        function playSmartMobileFallback(text, character) {
+            if (!('speechSynthesis' in window)) return;
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance(text);
+            utter.lang = 'id-ID';
+            // Atur tinggi nada & kecepatan agar suara Anak Cilik vs Ibu Guru tetap terasa jelas bedanya
+            if (character === 'child') {
+                utter.pitch = 1.45; // Nada tinggi ceria khas anak kecil
+                utter.rate = 1.08;
+            } else {
+                utter.pitch = 1.1;  // Nada lembut khas Ibu Guru
+                utter.rate = 0.96;
+            }
+            const voices = window.speechSynthesis.getVoices();
+            const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().includes('id') && 
+                (v.name.toLowerCase().includes('female') || v.name.toLowerCase().includes('gadis') || v.name.toLowerCase().includes('damayanti') || v.name.toLowerCase().includes('indonesia')));
+            if (idVoice) utter.voice = idVoice;
+            window.speechSynthesis.speak(utter);
+        }
+
         async function speakText(text) {
-            initTtsAudio(); // Wajib di-unlock sinkron tepat saat diketuk
             stopActiveSpeech();
             const myRequestId = ++activeRequestId;
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
 
+            // LANGKAH 1: Buka kunci Audio HP secara SINKRON tepat saat tombol disentuh
+            if (!currentHtmlAudio) {
+                currentHtmlAudio = new Audio();
+                currentHtmlAudio.playsInline = true;
+            }
+            let audioCtx = null;
             try {
-                let audioBuffer = ttsAudioCache[cacheKey];
+                audioCtx = getSharedAudioContext();
+                if (audioCtx && audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+            } catch (e) {}
+
+            try {
+                let audioDataObj = ttsRawPcmCache[cacheKey];
                 
-                if (!audioBuffer) {
+                // Jika sudah ada di cache (karena sudah di-preload), langsung putar INSTAN secara sinkron!
+                if (!audioDataObj) {
                     const isChild = selectedVoiceCharacter === 'child';
                     setTtsStatus(true, isChild ? '👧 Menyiapkan suara AI Teman Cilik...' : '👩‍🏫 Menyiapkan suara AI Ibu Guru...', false);
 
-                    audioBuffer = await fetchGeminiTtsData(text, selectedVoiceCharacter);
+                    audioDataObj = await fetchGeminiTtsData(text, selectedVoiceCharacter);
                     if (myRequestId !== activeRequestId) return;
                 }
 
                 setTtsStatus(false);
 
-                // Mainkan frekuensi suara (Ponsel tidak bisa memblokir metode ini walau proses async tertunda)
-                currentTtsSource = ttsAudioCtx.createBufferSource();
-                currentTtsSource.buffer = audioBuffer;
-                currentTtsSource.playbackRate.value = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
-                currentTtsSource.connect(ttsAudioCtx.destination);
-                currentTtsSource.start(0);
+                // LANGKAH 2: Coba putar via Web Audio API (Mendukung pitch/playbackRate anak cilik)
+                let playedSuccess = false;
+                if (audioCtx) {
+                    try {
+                        if (audioCtx.state === 'suspended') await audioCtx.resume();
+                        const audioBuffer = audioCtx.createBuffer(1, audioDataObj.float32Data.length, audioDataObj.sampleRate);
+                        audioBuffer.getChannelData(0).set(audioDataObj.float32Data);
 
-                // Pengaman ekstra untuk Safari iOS (Kadang context otomatis tertidur ulang)
-                if (ttsAudioCtx.state === 'suspended') {
-                    await ttsAudioCtx.resume();
+                        const source = audioCtx.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.playbackRate.value = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
+                        source.connect(audioCtx.destination);
+                        source.start(0);
+                        currentWebAudioSource = source;
+                        playedSuccess = true;
+                    } catch (webAudioErr) {
+                        console.warn("WebAudio fallback ke HTML5 Audio:", webAudioErr);
+                    }
+                }
+
+                // LANGKAH 3: Jika Web Audio gagal di HP, putar via WAV HTML5 <audio>
+                if (!playedSuccess && audioDataObj.wavUrl) {
+                    currentHtmlAudio.src = audioDataObj.wavUrl;
+                    currentHtmlAudio.playbackRate = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
+                    await currentHtmlAudio.play();
                 }
 
             } catch (err) {
                 if (myRequestId !== activeRequestId) return;
-                console.error("AI Audio Error:", err);
-                setTtsStatus(true, '⚠️ Gagal memuat suara. Ketuk tombol sekali lagi.', true);
-                setTimeout(() => setTtsStatus(false), 4000);
+                console.warn("Beralih ke Suara Pintar Perangkat:", err);
+                setTtsStatus(false);
+                // Tidak menampilkan pesan error merah yang mengganggu, langsung putar suara cadangan!
+                playSmartMobileFallback(text, selectedVoiceCharacter);
             }
         }
 
-        // Preload otomatis kalimat penjelasan di latar belakang
+        // Preload semua 6 kalimat penjelasan utama di latar belakang TANPA menyentuh AudioContext
         const MAIN_PROMPTS_TO_PRELOAD = [
             'Ide pokok adalah kepala kereta atau bos cerita yang menarik semua kalimat lain. Sedangkan ide pendukung adalah gerbong di belakangnya yang menceritakan rinciannya!',
             'Ada tiga jenis paragraf. Paragraf Deduktif ide pokoknya di depan atau awal. Paragraf Induktif ide pokoknya di akhir. Dan paragraf campuran ide pokoknya ada di awal dan diulang di akhir.',
@@ -1243,13 +1290,19 @@
         async function preloadAllMainPrompts(character) {
             const badge = document.getElementById('preload-badge');
             if (badge) badge.textContent = '⏳ Memuat AI...';
-            // Muat kalimat pertama & kedua terlebih dahulu (Tab 1 yang langsung dilihat anak)
-            for (let i = 0; i < 2; i++) {
+            // Unduh ke-6 suara tab secara bertahap di memori tanpa membuat AudioContext
+            for (let i = 0; i < MAIN_PROMPTS_TO_PRELOAD.length; i++) {
                 try {
                     await fetchGeminiTtsData(MAIN_PROMPTS_TO_PRELOAD[i], character);
-                } catch (e) {}
+                    if (i === 0 && badge) badge.textContent = '✨ AI Siap!';
+                } catch (e) {
+                    if (badge) badge.textContent = '🔊 Suara Aktif';
+                    break;
+                }
             }
-            if (badge) badge.textContent = '✨ AI Siap!';
+            if (badge && badge.textContent === '⏳ Memuat AI...') {
+                badge.textContent = '✨ AI Siap!';
+            }
         }
 
         // ==================== NAVIGASI TAB ====================
