@@ -71,7 +71,19 @@
             </div>
             
             <!-- Star Counter & Audio Toggle -->
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-3">
+                <!-- Pilihan Karakter Suara AI -->
+                <div class="bg-white/20 backdrop-blur-sm px-3 py-1.5 rounded-2xl flex items-center gap-2 border-2 border-white/40">
+                    <span class="text-xl" id="voice-avatar">👧</span>
+                    <div>
+                        <label for="voice-character-select" class="block text-[10px] font-bold text-yellow-200 uppercase leading-none">Suara AI Pendamping</label>
+                        <select id="voice-character-select" onchange="changeVoiceCharacter(this.value)" class="bg-transparent text-white font-bold text-xs md:text-sm focus:outline-none cursor-pointer pr-1">
+                            <option value="child" class="text-slate-800 font-bold" selected>👧 Teman Cilik (Suara Anak Ceria)</option>
+                            <option value="woman" class="text-slate-800 font-bold">👩‍🏫 Ibu Guru (Suara Wanita Lembut)</option>
+                        </select>
+                    </div>
+                </div>
+
                 <div class="bg-white/20 backdrop-blur-sm px-4 py-1.5 rounded-2xl flex items-center gap-2 border-2 border-white/40">
                     <span class="text-2xl">⭐</span>
                     <div>
@@ -80,6 +92,12 @@
                     </div>
                 </div>
             </div>
+        </div>
+
+        <!-- Status Loading Suara AI -->
+        <div id="tts-status-bar" class="hidden bg-amber-300 text-slate-900 text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2">
+            <span class="animate-spin inline-block">⏳</span>
+            <span id="tts-status-text">Sedang menyiapkan suara AI...</span>
         </div>
 
         <!-- Navigation Tabs -->
@@ -977,17 +995,183 @@
             }
         }
 
-        // ==================== FITUR SUARA (WEB SPEECH API) ====================
-        function speakText(text) {
+        // ==================== FITUR SUARA AI (GEMINI TTS + FALLBACK WEB SPEECH) ====================
+        let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
+        let currentAudioPlayer = null;
+        const ttsAudioCache = {}; // Menyimpan hasil suara agar tidak perlu memuat ulang
+
+        function changeVoiceCharacter(val) {
+            playClickSound();
+            selectedVoiceCharacter = val;
+            const avatarEl = document.getElementById('voice-avatar');
+            if (avatarEl) {
+                avatarEl.textContent = val === 'child' ? '👧' : '👩‍🏫';
+            }
+            if (currentAudioPlayer) {
+                currentAudioPlayer.pause();
+                currentAudioPlayer = null;
+            }
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+            }
+        }
+
+        function base64ToArrayBuffer(base64) {
+            const binaryString = window.atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        function pcmToWav(pcm16, sampleRate) {
+            const buffer = new ArrayBuffer(44 + pcm16.length * 2);
+            const view = new DataView(buffer);
+            const writeString = (offset, str) => {
+                for (let i = 0; i < str.length; i++) {
+                    view.setUint8(offset + i, str.charCodeAt(i));
+                }
+            };
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + pcm16.length * 2, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM format
+            view.setUint16(22, 1, true); // Mono
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, pcm16.length * 2, true);
+            let offset = 44;
+            for (let i = 0; i < pcm16.length; i++, offset += 2) {
+                view.setInt16(offset, pcm16[i], true);
+            }
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+
+        function setTtsStatus(visible, message = '') {
+            const bar = document.getElementById('tts-status-bar');
+            const txt = document.getElementById('tts-status-text');
+            if (!bar || !txt) return;
+            if (visible) {
+                txt.textContent = message;
+                bar.classList.remove('hidden');
+            } else {
+                bar.classList.add('hidden');
+            }
+        }
+
+        function fallbackBrowserSpeech(text) {
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
                 const utterance = new SpeechSynthesisUtterance(text);
                 utterance.lang = 'id-ID';
-                utterance.rate = 0.95;
-                utterance.pitch = 1.1;
+                const voices = window.speechSynthesis.getVoices();
+                // Cari suara Bahasa Indonesia (prioritaskan suara wanita seperti Gadis / Google Bahasa Indonesia)
+                const idVoice = voices.find(v => v.lang.includes('id') && (v.name.toLowerCase().includes('female') || v.name.toLowerCase().includes('gadis') || v.name.toLowerCase().includes('google'))) 
+                             || voices.find(v => v.lang.includes('id'));
+                if (idVoice) utterance.voice = idVoice;
+
+                if (selectedVoiceCharacter === 'child') {
+                    utterance.pitch = 1.55; // Nada tinggi menyerupai suara anak-anak
+                    utterance.rate = 1.05;
+                } else {
+                    utterance.pitch = 1.15; // Nada suara wanita dewasa yang ramah
+                    utterance.rate = 0.95;
+                }
                 window.speechSynthesis.speak(utterance);
-            } else {
-                alert(text);
+            }
+        }
+
+        async function speakText(text) {
+            playClickSound();
+            // Hentikan audio sebelumnya jika sedang berjalan
+            if (currentAudioPlayer) {
+                currentAudioPlayer.pause();
+                currentAudioPlayer = null;
+            }
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+            }
+
+            const cacheKey = `${selectedVoiceCharacter}:${text}`;
+            if (ttsAudioCache[cacheKey]) {
+                currentAudioPlayer = new Audio(ttsAudioCache[cacheKey]);
+                currentAudioPlayer.play();
+                return;
+            }
+
+            // Konfigurasi suara Gemini TTS berdasarkan pilihan karakter
+            const isChild = selectedVoiceCharacter === 'child';
+            const voiceName = isChild ? 'Leda' : 'Aoede'; // Leda = Youthful (Anak/Remaja ceria), Aoede = Wanita lembut
+            const stylePrompt = isChild
+                ? `Ucapkan dalam Bahasa Indonesia dengan suara anak perempuan sekolah dasar yang ceria, imut, antusias, dan bersahabat: "${text}"`
+                : `Ucapkan dalam Bahasa Indonesia dengan suara wanita dewasa (Ibu Guru) yang lembut, keibuan, jelas, dan ramah: "${text}"`;
+
+            const statusLabel = isChild ? '👧 Menyiapkan suara Teman Cilik AI...' : '👩‍🏫 Menyiapkan suara Ibu Guru AI...';
+            setTtsStatus(true, statusLabel);
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+            const payload = {
+                contents: [{ parts: [{ text: stylePrompt }] }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName: voiceName }
+                        }
+                    }
+                },
+                model: "gemini-2.5-flash-preview-tts"
+            };
+
+            try {
+                let response;
+                const delays = [1000, 2000, 4000];
+                for (let attempt = 0; attempt <= delays.length; attempt++) {
+                    response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    if (response.ok) break;
+                    if (attempt < delays.length) {
+                        await new Promise(r => setTimeout(r, delays[attempt]));
+                    }
+                }
+
+                if (!response || !response.ok) throw new Error('TTS API request failed');
+
+                const result = await response.json();
+                const part = result?.candidates?.[0]?.content?.parts?.[0];
+                const audioData = part?.inlineData?.data;
+                const mimeType = part?.inlineData?.mimeType;
+
+                if (audioData && mimeType && mimeType.startsWith("audio/")) {
+                    const rateMatch = mimeType.match(/rate=(\d+)/);
+                    const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+                    const pcmData = base64ToArrayBuffer(audioData);
+                    const pcm16 = new Int16Array(pcmData);
+                    const wavBlob = pcmToWav(pcm16, sampleRate);
+                    const audioUrl = URL.createObjectURL(wavBlob);
+
+                    ttsAudioCache[cacheKey] = audioUrl;
+                    setTtsStatus(false);
+                    currentAudioPlayer = new Audio(audioUrl);
+                    currentAudioPlayer.play();
+                } else {
+                    throw new Error('Invalid audio format');
+                }
+            } catch (err) {
+                setTtsStatus(false);
+                // Jika koneksi ke AI TTS gagal, otomatis gunakan suara browser yang sudah diatur nada anak/wanita
+                fallbackBrowserSpeech(text);
             }
         }
 
