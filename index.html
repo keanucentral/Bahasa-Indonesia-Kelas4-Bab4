@@ -76,7 +76,10 @@
                 <div class="bg-white/20 backdrop-blur-sm px-3 py-1.5 rounded-2xl flex items-center gap-2 border-2 border-white/40">
                     <span class="text-xl" id="voice-avatar">👧</span>
                     <div>
-                        <label for="voice-character-select" class="block text-[10px] font-bold text-yellow-200 uppercase leading-none">Suara AI Pendamping</label>
+                        <div class="flex items-center gap-1.5">
+                            <label for="voice-character-select" class="block text-[10px] font-bold text-yellow-200 uppercase leading-none">Suara AI Pendamping</label>
+                            <span id="preload-badge" class="bg-emerald-400 text-slate-900 text-[9px] font-extrabold px-1.5 py-0.2 rounded-full">AI HD</span>
+                        </div>
                         <select id="voice-character-select" onchange="changeVoiceCharacter(this.value)" class="bg-transparent text-white font-bold text-xs md:text-sm focus:outline-none cursor-pointer pr-1">
                             <option value="child" class="text-slate-800 font-bold" selected>👧 Teman Cilik (Suara Anak Ceria)</option>
                             <option value="woman" class="text-slate-800 font-bold">👩‍🏫 Ibu Guru (Suara Wanita Lembut)</option>
@@ -995,61 +998,92 @@
             }
         }
 
-        // ==================== FITUR SUARA AI (GEMINI TTS + FALLBACK WEB SPEECH) ====================
+        // ==================== FITUR SUARA AI MURNI (KHUSUS SMARTPHONE & DESKTOP) ====================
         let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
-        let currentAudioSource = null;
-        let ttsAudioCtx = null;
-        const ttsAudioCache = {}; // Menyimpan hasil buffer suara agar tidak perlu memuat ulang
+        const ttsAudioCache = {}; // Menyimpan Blob URL WAV hasil AI agar instan di HP
+        const pendingFetches = {}; // Mencegah request ganda untuk teks yang sama
+        let activeRequestId = 0;
 
-        // Membuka kunci AudioContext saat pengguna pertama kali menyentuh layar HP
-        function unlockMobileAudio() {
-            if (!ttsAudioCtx) {
-                const AudioCtx = window.AudioContext || window.webkitAudioContext;
-                ttsAudioCtx = new AudioCtx();
-            }
-            if (ttsAudioCtx.state === 'suspended') {
-                ttsAudioCtx.resume();
-            }
-            // Mainkan buffer hening 1 sampel agar iOS/Android mengizinkan audio setelah proses fetch API
-            try {
-                const silentBuffer = ttsAudioCtx.createBuffer(1, 1, 22050);
-                const source = ttsAudioCtx.createBufferSource();
-                source.buffer = silentBuffer;
-                source.connect(ttsAudioCtx.destination);
-                source.start(0);
-            } catch (e) {}
+        // Elemen <audio> tunggal khusus Smartphone:
+        // Di Android/iOS, jika elemen <audio> yang SAMA dipanggil .play() saat klik,
+        // maka elemen tersebut diizinkan memutar src baru setelah proses await fetch selesai!
+        const mobileAudioPlayer = new Audio();
+        mobileAudioPlayer.playsInline = true;
+        mobileAudioPlayer.preload = 'auto';
+
+        // Buat file WAV hening berdurasi 0.05 detik untuk membuka kunci izin audio di Smartphone tepat saat tombol disentuh
+        function createSilentWavDataUri() {
+            const sampleRate = 8000;
+            const numSamples = 400;
+            const buffer = new ArrayBuffer(44 + numSamples * 2);
+            const view = new DataView(buffer);
+            const writeStr = (offset, str) => {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            };
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + numSamples * 2, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeStr(36, 'data');
+            view.setUint32(40, numSamples * 2, true);
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            return 'data:audio/wav;base64,' + window.btoa(binary);
         }
 
-        // Pasang pendengar sentuhan pertama di layar smartphone
-        document.addEventListener('touchstart', unlockMobileAudio, { once: true });
-        document.addEventListener('click', unlockMobileAudio, { once: true });
+        const SILENT_WAV_URI = createSilentWavDataUri();
 
-        function stopActiveSpeech() {
-            if (currentAudioSource) {
-                try {
-                    currentAudioSource.stop();
-                    currentAudioSource.disconnect();
-                } catch (e) {}
-                currentAudioSource = null;
-            }
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
-        }
+        // Konversi PCM16 dari Gemini TTS menjadi file WAV standar (Blob URL) yang 100% didukung semua browser HP
+        function pcm16ToWavBlobUrl(pcm16, sampleRate, speedMultiplier = 1.0) {
+            // Pada smartphone, kita juga menyuntikkan sampleRate yang sedikit disesuaikan
+            // agar karakter suara Anak ("child") terdengar lebih imut & ceria secara akustik
+            const effectiveSampleRate = Math.round(sampleRate * speedMultiplier);
+            const numChannels = 1;
+            const bitsPerSample = 16;
+            const byteRate = effectiveSampleRate * numChannels * (bitsPerSample / 8);
+            const blockAlign = numChannels * (bitsPerSample / 8);
+            const dataSize = pcm16.length * 2;
 
-        function changeVoiceCharacter(val) {
-            unlockMobileAudio();
-            playClickSound();
-            selectedVoiceCharacter = val;
-            const avatarEl = document.getElementById('voice-avatar');
-            if (avatarEl) {
-                avatarEl.textContent = val === 'child' ? '👧' : '👩‍🏫';
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+            const writeStr = (offset, str) => {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            };
+
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true); // Subchunk1Size (16 untuk PCM)
+            view.setUint16(20, 1, true);  // AudioFormat (1 = PCM)
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, effectiveSampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitsPerSample, true);
+            writeStr(36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            let offset = 44;
+            for (let i = 0; i < pcm16.length; i++, offset += 2) {
+                view.setInt16(offset, pcm16[i], true);
             }
-            stopActiveSpeech();
+
+            const blob = new Blob([buffer], { type: 'audio/wav' });
+            return URL.createObjectURL(blob);
         }
 
         function base64ToArrayBuffer(base64) {
-            const binaryString = window.atob(base64);
+            const cleaned = base64.replace(/[\r\n\s]+/g, '');
+            const binaryString = window.atob(cleaned);
             const len = binaryString.length;
             const bytes = new Uint8Array(len);
             for (let i = 0; i < len; i++) {
@@ -1058,34 +1092,37 @@
             return bytes.buffer;
         }
 
-        // Konversi langsung PCM16 dari Gemini TTS ke AudioBuffer (Web Audio API)
-        function playPcm16Buffer(pcm16, sampleRate) {
-            unlockMobileAudio();
-            stopActiveSpeech();
-
-            const audioBuffer = ttsAudioCtx.createBuffer(1, pcm16.length, sampleRate);
-            const channelData = audioBuffer.getChannelData(0);
-            for (let i = 0; i < pcm16.length; i++) {
-                channelData[i] = pcm16[i] / 32768.0;
+        function stopActiveSpeech() {
+            activeRequestId++;
+            try {
+                mobileAudioPlayer.pause();
+                mobileAudioPlayer.currentTime = 0;
+            } catch (e) {}
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
             }
-
-            const source = ttsAudioCtx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(ttsAudioCtx.destination);
-            source.onended = () => {
-                if (currentAudioSource === source) {
-                    currentAudioSource = null;
-                }
-            };
-            currentAudioSource = source;
-            source.start(0);
         }
 
-        function setTtsStatus(visible, message = '') {
+        function changeVoiceCharacter(val) {
+            playClickSound();
+            selectedVoiceCharacter = val;
+            const avatarEl = document.getElementById('voice-avatar');
+            if (avatarEl) {
+                avatarEl.textContent = val === 'child' ? '👧' : '👩‍🏫';
+            }
+            stopActiveSpeech();
+            // Preload ulang kalimat utama untuk karakter yang baru dipilih
+            preloadAllMainPrompts(val);
+        }
+
+        function setTtsStatus(visible, message = '', isError = false) {
             const bar = document.getElementById('tts-status-bar');
             const txt = document.getElementById('tts-status-text');
             if (!bar || !txt) return;
             if (visible) {
+                bar.className = isError
+                    ? "bg-rose-500 text-white text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2"
+                    : "bg-amber-300 text-slate-900 text-xs font-extrabold py-1.5 px-4 text-center shadow-inner flex items-center justify-center gap-2";
                 txt.textContent = message;
                 bar.classList.remove('hidden');
             } else {
@@ -1093,62 +1130,22 @@
             }
         }
 
-        // Cadangan terakhir jika sedang offline: menggunakan pitch Web Audio atau Web Speech
-        function fallbackBrowserSpeech(text, attempt = 0) {
-            if (!('speechSynthesis' in window)) return;
-            
-            const voices = window.speechSynthesis.getVoices();
-            if (voices.length === 0 && attempt < 10) {
-                setTimeout(() => fallbackBrowserSpeech(text, attempt + 1), 200);
-                return;
-            }
-
-            window.speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.lang = 'id-ID';
-            
-            const idVoice = voices.find(v => v.lang.replace('_', '-').toLowerCase().includes('id') && 
-                            (v.name.toLowerCase().includes('female') || 
-                             v.name.toLowerCase().includes('gadis') || 
-                             v.name.toLowerCase().includes('damayanti') || 
-                             v.name.toLowerCase().includes('google'))) 
-                         || voices.find(v => v.lang.replace('_', '-').toLowerCase().includes('id'));
-                         
-            if (idVoice) utterance.voice = idVoice;
-
-            if (selectedVoiceCharacter === 'child') {
-                utterance.pitch = 1.5;
-                utterance.rate = 1.05;
-            } else {
-                utterance.pitch = 1.1;
-                utterance.rate = 0.95;
-            }
-            
-            window.speechSynthesis.speak(utterance);
-        }
-
-        async function speakText(text) {
-            // PENTING UNTUK SMARTPHONE: Buka kunci AudioContext tepat saat tombol ditekan (sebelum await fetch)
-            unlockMobileAudio();
-            playClickSound();
-            stopActiveSpeech();
-
-            const cacheKey = `${selectedVoiceCharacter}:${text}`;
+        // Fungsi pengambil suara AI Gemini TTS (menghasilkan Blob URL WAV)
+        async function fetchGeminiTtsWavUrl(text, character) {
+            const cacheKey = `${character}:${text}`;
             if (ttsAudioCache[cacheKey]) {
-                const cached = ttsAudioCache[cacheKey];
-                playPcm16Buffer(cached.pcm16, cached.sampleRate);
-                return;
+                return ttsAudioCache[cacheKey];
+            }
+            if (pendingFetches[cacheKey]) {
+                return pendingFetches[cacheKey];
             }
 
-            // Konfigurasi suara Gemini TTS berdasarkan pilihan karakter
-            const isChild = selectedVoiceCharacter === 'child';
-            const voiceName = isChild ? 'Leda' : 'Aoede'; // Leda = Suara Anak/Remaja ceria, Aoede = Suara Wanita lembut
+            const isChild = character === 'child';
+            // Gunakan Leda (Youthful) untuk anak cilik dan Aoede (Breezy/Warm) untuk Ibu Guru
+            const voiceName = isChild ? 'Leda' : 'Aoede';
             const stylePrompt = isChild
-                ? `Ucapkan kalimat berikut dalam Bahasa Indonesia dengan suara anak perempuan kecil yang ceria, imut, dan bersemangat: ${text}`
-                : `Ucapkan kalimat berikut dalam Bahasa Indonesia dengan suara Ibu Guru wanita dewasa yang lembut, ramah, dan jelas: ${text}`;
-
-            const statusLabel = isChild ? '👧 Menyiapkan suara Teman Cilik AI...' : '👩‍🏫 Menyiapkan suara Ibu Guru AI...';
-            setTtsStatus(true, statusLabel);
+                ? `Say cheerfully in Indonesian with a cute, bright, high-pitched young girl voice: "${text}"`
+                : `Say warmly in Indonesian with a gentle, clear, motherly female teacher voice: "${text}"`;
 
             const apiKey = "";
             const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
@@ -1161,51 +1158,124 @@
                             prebuiltVoiceConfig: { voiceName: voiceName }
                         }
                     }
-                },
-                model: "gemini-2.5-flash-preview-tts"
+                }
             };
 
-            try {
-                let response;
-                const delays = [1000, 2000, 4000];
+            const fetchPromise = (async () => {
+                const delays = [800, 1600, 3000];
+                let lastErr = null;
+
                 for (let attempt = 0; attempt <= delays.length; attempt++) {
-                    response = await fetch(apiUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    if (response.ok) break;
-                    if (attempt < delays.length) {
-                        await new Promise(r => setTimeout(r, delays[attempt]));
+                    try {
+                        const response = await fetch(apiUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+
+                        const result = await response.json();
+                        const parts = result?.candidates?.[0]?.content?.parts || [];
+                        const audioPart = parts.find(p => p.inlineData && p.inlineData.data);
+                        const audioData = audioPart?.inlineData?.data;
+                        const mimeType = audioPart?.inlineData?.mimeType || "audio/L16;rate=24000";
+
+                        if (!audioData) throw new Error('Audio data kosong');
+
+                        const rateMatch = mimeType.match(/rate=(\d+)/);
+                        const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+                        const pcmBuffer = base64ToArrayBuffer(audioData);
+                        const pcm16 = new Int16Array(pcmBuffer);
+
+                        // Untuk karakter anak, naikkan sedikit frekuensi sampel (1.08x) agar nada suaranya makin terdengar seperti anak kecil ceria
+                        const pitchFactor = isChild ? 1.08 : 1.0;
+                        const wavUrl = pcm16ToWavBlobUrl(pcm16, sampleRate, pitchFactor);
+
+                        ttsAudioCache[cacheKey] = wavUrl;
+                        delete pendingFetches[cacheKey];
+                        return wavUrl;
+                    } catch (err) {
+                        lastErr = err;
+                        if (attempt < delays.length) {
+                            await new Promise(r => setTimeout(r, delays[attempt]));
+                        }
                     }
                 }
+                delete pendingFetches[cacheKey];
+                throw lastErr;
+            })();
 
-                if (!response || !response.ok) throw new Error('TTS API request failed');
+            pendingFetches[cacheKey] = fetchPromise;
+            return fetchPromise;
+        }
 
-                const result = await response.json();
-                const part = result?.candidates?.[0]?.content?.parts?.[0];
-                const audioData = part?.inlineData?.data;
-                const mimeType = part?.inlineData?.mimeType;
+        async function speakText(text) {
+            stopActiveSpeech();
+            const myRequestId = ++activeRequestId;
 
-                if (audioData && mimeType && mimeType.startsWith("audio/")) {
-                    const rateMatch = mimeType.match(/rate=(\d+)/);
-                    const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
-                    const pcmData = base64ToArrayBuffer(audioData);
-                    const pcm16 = new Int16Array(pcmData);
+            const cacheKey = `${selectedVoiceCharacter}:${text}`;
 
-                    // Simpan ke cache dalam bentuk PCM16 agar ringan & bisa langsung diputar ulang
-                    ttsAudioCache[cacheKey] = { pcm16, sampleRate };
-                    setTtsStatus(false);
-
-                    // Putar menggunakan Web Audio API yang sudah di-unlock saat tombol diklik
-                    playPcm16Buffer(pcm16, sampleRate);
-                } else {
-                    throw new Error('Invalid audio format');
-                }
-            } catch (err) {
+            // 1. Jika suara AI sudah ada di cache (atau sudah selesai di-preload), langsung putar seketika!
+            if (ttsAudioCache[cacheKey]) {
                 setTtsStatus(false);
-                fallbackBrowserSpeech(text);
+                mobileAudioPlayer.src = ttsAudioCache[cacheKey];
+                mobileAudioPlayer.currentTime = 0;
+                mobileAudioPlayer.play().catch(() => {});
+                return;
             }
+
+            // 2. KUNCI UTAMA SMARTPHONE: Putar WAV hening pada objek mobileAudioPlayer Tepat Saat Jari Menyentuh Tombol!
+            // Ini menjaga "user gesture token" tetap aktif pada elemen <audio> tersebut selama menunggu respon API AI.
+            try {
+                mobileAudioPlayer.src = SILENT_WAV_URI;
+                await mobileAudioPlayer.play();
+            } catch (e) {}
+
+            const isChild = selectedVoiceCharacter === 'child';
+            const statusLabel = isChild
+                ? '👧 Menyiapkan suara AI Teman Cilik (Mohon tunggu 2 detik)...'
+                : '👩‍🏫 Menyiapkan suara AI Ibu Guru (Mohon tunggu 2 detik)...';
+            setTtsStatus(true, statusLabel, false);
+
+            try {
+                const wavUrl = await fetchGeminiTtsWavUrl(text, selectedVoiceCharacter);
+                if (myRequestId !== activeRequestId) return; // Dibatalkan karena pengguna menekan tombol lain
+
+                setTtsStatus(false);
+                mobileAudioPlayer.src = wavUrl;
+                mobileAudioPlayer.currentTime = 0;
+                await mobileAudioPlayer.play();
+            } catch (err) {
+                if (myRequestId !== activeRequestId) return;
+                // Jangan pernah memanggil speechSynthesis robot bawaan HP! Berikan info agar pengguna menekan ulang.
+                setTtsStatus(true, '⚠️ Koneksi suara AI sedang sibuk. Silakan ketuk tombol "🔊 Dengarkan" sekali lagi ya!', true);
+                setTimeout(() => setTtsStatus(false), 4000);
+            }
+        }
+
+        // Preload otomatis kalimat penjelasan di latar belakang agar saat dibuka di HP langsung berbunyi tanpa loading!
+        const MAIN_PROMPTS_TO_PRELOAD = [
+            'Ide pokok adalah kepala kereta atau bos cerita yang menarik semua kalimat lain. Sedangkan ide pendukung adalah gerbong di belakangnya yang menceritakan rinciannya!',
+            'Ada tiga jenis paragraf. Paragraf Deduktif ide pokoknya di depan atau awal. Paragraf Induktif ide pokoknya di akhir. Dan paragraf campuran ide pokoknya ada di awal dan diulang di akhir.',
+            'Kalimat persuasif adalah kalimat yang bertujuan mengajak atau membujuk orang lain melakukan sesuatu. Cirinya menggunakan kata Ayo, Mari, atau Yuk, dan diakhiri tanda seru!',
+            'Volume adalah keras atau pelannya suara kita. Sedangkan intonasi adalah naik turunnya nada suara saat berbicara.',
+            'Dalam wawancara ada dua tokoh penting. Pewawancara adalah orang yang bertanya. Sedangkan Narasumber adalah orang ahli yang menjawab pertanyaan dan memberi informasi.',
+            'Majas personifikasi adalah gaya bahasa yang mengumpamakan benda mati seolah-olah bisa bergerak, merasa, atau bertingkah laku seperti manusia. Contohnya: Mentari pagi bangun dari tidurnya.'
+        ];
+
+        async function preloadAllMainPrompts(character) {
+            const badge = document.getElementById('preload-badge');
+            if (badge) badge.textContent = '⏳ Memuat AI...';
+            // Muat kalimat pertama & kedua terlebih dahulu (Tab 1 yang langsung dilihat anak)
+            for (let i = 0; i < 2; i++) {
+                try {
+                    await fetchGeminiTtsWavUrl(MAIN_PROMPTS_TO_PRELOAD[i], character);
+                } catch (e) {}
+            }
+            if (badge) badge.textContent = '✨ AI Siap!';
         }
 
         // ==================== NAVIGASI TAB ====================
@@ -1801,6 +1871,8 @@
             setVoiceScenario(0);
             renderPTypeGame();
             renderQuiz();
+            // Siapkan suara AI di latar belakang sejak halaman dibuka di HP
+            preloadAllMainPrompts(selectedVoiceCharacter);
         };
     </script>
 </body>
