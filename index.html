@@ -1000,29 +1000,20 @@
 
         // ==================== FITUR SUARA AI MURNI (KHUSUS SMARTPHONE & DESKTOP) ====================
         let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
-        const ttsAudioCache = {}; // Menyimpan data PCM Float32 agar bebas blokir di HP
+        const ttsAudioCache = {}; // Menyimpan data WAV Blob agar bebas blokir di HP
         const pendingFetches = {}; // Mencegah request ganda untuk teks yang sama
         let activeRequestId = 0;
 
-        let ttsAudioCtx = null;
-        let currentTtsSource = null;
+        let ttsAudioElement = null;
 
-        // Inisialisasi AudioContext harus dipanggil seketika saat tombol disentuh!
-        function initTtsAudioCtx() {
-            if (!ttsAudioCtx) {
-                ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // Inisialisasi Audio Element harus dipanggil seketika saat tombol disentuh!
+        function initTtsAudioElement() {
+            if (!ttsAudioElement) {
+                ttsAudioElement = new Audio();
                 // Trik "Unlock" khusus untuk iOS Safari dan Chrome Android
-                // Memutar suara kosong/siluman agar browser HP mengizinkan suara AI masuk nantinya
-                const osc = ttsAudioCtx.createOscillator();
-                const gain = ttsAudioCtx.createGain();
-                gain.gain.value = 0;
-                osc.connect(gain);
-                gain.connect(ttsAudioCtx.destination);
-                osc.start(0);
-                osc.stop(0.001);
-            }
-            if (ttsAudioCtx.state === 'suspended') {
-                ttsAudioCtx.resume();
+                // Memutar WAV diam/siluman agar browser mengizinkan pemutaran via JavaScript
+                ttsAudioElement.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+                ttsAudioElement.play().catch(e => console.log('Unlock pending:', e));
             }
         }
 
@@ -1037,11 +1028,50 @@
             return bytes.buffer;
         }
 
+        // MESIN KONVERSI KE FORMAT WAV STANDAR (ANTI-CRASH)
+        function pcmToWav(pcm16, sampleRate) {
+            const numChannels = 1;
+            const byteRate = sampleRate * numChannels * 2;
+            const blockAlign = numChannels * 2;
+            const dataSize = pcm16.length * 2;
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+
+            const writeString = (offset, string) => {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            };
+
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM format
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, 16, true); // 16-bit
+            writeString(36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            // Tulis data PCM dengan aman ke format Little-Endian (menghindari error arsitektur HP & Desktop)
+            let offset = 44;
+            for (let i = 0; i < pcm16.length; i++) {
+                view.setInt16(offset, pcm16[i], true);
+                offset += 2;
+            }
+
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+
         function stopActiveSpeech() {
             activeRequestId++;
-            if (currentTtsSource) {
-                try { currentTtsSource.stop(); } catch(e) {}
-                currentTtsSource = null;
+            if (ttsAudioElement) {
+                ttsAudioElement.pause();
+                ttsAudioElement.currentTime = 0;
             }
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
@@ -1056,7 +1086,6 @@
                 avatarEl.textContent = val === 'child' ? '👧' : '👩‍🏫';
             }
             stopActiveSpeech();
-            // Preload ulang kalimat utama untuk karakter yang baru dipilih
             preloadAllMainPrompts(val);
         }
 
@@ -1102,7 +1131,7 @@
             };
 
             const fetchPromise = (async () => {
-                const delays = [800, 1600, 3000];
+                const delays = [1000, 2000, 3000];
                 let lastErr = null;
 
                 for (let attempt = 0; attempt <= delays.length; attempt++) {
@@ -1113,42 +1142,44 @@
                             body: JSON.stringify(payload)
                         });
 
-                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        if (!response.ok) {
+                            const errTxt = await response.text();
+                            throw new Error(`HTTP ${response.status}: ${errTxt}`);
+                        }
 
                         const result = await response.json();
                         const parts = result?.candidates?.[0]?.content?.parts || [];
                         const audioPart = parts.find(p => p.inlineData && p.inlineData.data);
-                        const audioData = audioPart?.inlineData?.data;
-                        const mimeType = audioPart?.inlineData?.mimeType || "audio/L16;rate=24000";
-
-                        if (!audioData) throw new Error('Audio data kosong dari AI');
+                        
+                        if (!audioPart || !audioPart.inlineData) {
+                            throw new Error('Audio data kosong atau struktur API berubah.');
+                        }
+                        
+                        const audioData = audioPart.inlineData.data;
+                        const mimeType = audioPart.inlineData.mimeType || "audio/L16;rate=24000";
 
                         const rateMatch = mimeType.match(/rate=(\d+)/);
                         const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
                         
                         const pcmBuffer = base64ToArrayBuffer(audioData);
                         
-                        // SANGAT PENTING: Pastikan byteLength genap. 
-                        // Jika ganjil (bug konversi di HP), sistem Int16Array akan seketika CRASH!
+                        // PERBAIKAN BUG UTAMA: Memastikan buffer genap untuk menghindari crash Float32/Int16
                         const validLength = pcmBuffer.byteLength - (pcmBuffer.byteLength % 2);
-                        const pcm16 = new Int16Array(pcmBuffer, 0, validLength / 2);
+                        const safeBuffer = pcmBuffer.slice(0, validLength);
+                        const pcm16 = new Int16Array(safeBuffer);
 
-                        // Konversi PCM16 ke Float32 untuk Web Audio API
-                        const float32 = new Float32Array(pcm16.length);
-                        for (let i = 0; i < pcm16.length; i++) {
-                            float32[i] = pcm16[i] / 32768.0;
-                        }
+                        // Konversi ke File WAV Standar
+                        const wavBlob = pcmToWav(pcm16, sampleRate);
+                        const audioUrl = URL.createObjectURL(wavBlob);
 
-                        // Penyesuaian pitch untuk suara anak
-                        const pitchFactor = isChild ? 1.08 : 1.0;
-                        const effectiveSampleRate = Math.round(sampleRate * pitchFactor);
-
-                        const audioObj = { pcmFloat32: float32, sampleRate: effectiveSampleRate };
+                        const audioObj = { url: audioUrl };
                         ttsAudioCache[cacheKey] = audioObj;
                         delete pendingFetches[cacheKey];
                         return audioObj;
+                        
                     } catch (err) {
                         lastErr = err;
+                        console.warn("AI Voice Fetch Retry:", attempt, err);
                         if (attempt < delays.length) {
                             await new Promise(r => setTimeout(r, delays[attempt]));
                         }
@@ -1163,7 +1194,7 @@
         }
 
         async function speakText(text) {
-            initTtsAudioCtx(); // Panggil segera saat diklik agar HP mengizinkan pemutaran
+            initTtsAudioElement(); // Panggil segera saat diklik agar HP mengizinkan pemutaran
             stopActiveSpeech();
             const myRequestId = ++activeRequestId;
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
@@ -1185,21 +1216,22 @@
 
                 setTtsStatus(false);
 
-                // Buat dan putar AudioBuffer menggunakan Web Audio API
-                // Amankan sampleRate agar selalu di batas spesifikasi wajib W3C (8000 - 96000)
-                const safeSampleRate = Math.max(8000, Math.min(96000, audioObj.sampleRate));
-                const buffer = ttsAudioCtx.createBuffer(1, audioObj.pcmFloat32.length, safeSampleRate);
-                buffer.getChannelData(0).set(audioObj.pcmFloat32);
-
-                currentTtsSource = ttsAudioCtx.createBufferSource();
-                currentTtsSource.buffer = buffer;
-                currentTtsSource.connect(ttsAudioCtx.destination);
-                currentTtsSource.start(0);
+                // Putar menggunakan elemen <audio> standar yang terbukti 100% stabil di semua perangkat
+                ttsAudioElement.src = audioObj.url;
+                ttsAudioElement.playbackRate = selectedVoiceCharacter === 'child' ? 1.08 : 1.0;
+                
+                try {
+                    await ttsAudioElement.play();
+                } catch (playErr) {
+                    console.error("Audio playback error:", playErr);
+                    setTtsStatus(true, '⚠️ Tap sekali lagi untuk mengizinkan suara keluar.', true);
+                    setTimeout(() => setTtsStatus(false), 3000);
+                }
 
             } catch (err) {
                 if (myRequestId !== activeRequestId) return;
                 console.error("AI Audio Error:", err);
-                setTtsStatus(true, '⚠️ Gagal memuat suara. Pastikan internet stabil dan coba lagi.', true);
+                setTtsStatus(true, '⚠️ Gagal memuat suara. Coba klik lagi dalam beberapa detik.', true);
                 setTimeout(() => setTtsStatus(false), 4000);
             }
         }
