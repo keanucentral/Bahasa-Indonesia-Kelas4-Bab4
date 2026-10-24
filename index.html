@@ -1008,10 +1008,18 @@
         let currentTtsSource = null;
 
         // Inisialisasi AudioContext harus dipanggil seketika saat tombol disentuh!
-        // Ini adalah kunci utama agar suara tidak diblokir oleh browser HP (Autoplay Policy)
         function initTtsAudioCtx() {
             if (!ttsAudioCtx) {
                 ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                // Trik "Unlock" khusus untuk iOS Safari dan Chrome Android
+                // Memutar suara kosong/siluman agar browser HP mengizinkan suara AI masuk nantinya
+                const osc = ttsAudioCtx.createOscillator();
+                const gain = ttsAudioCtx.createGain();
+                gain.gain.value = 0;
+                osc.connect(gain);
+                gain.connect(ttsAudioCtx.destination);
+                osc.start(0);
+                osc.stop(0.001);
             }
             if (ttsAudioCtx.state === 'suspended') {
                 ttsAudioCtx.resume();
@@ -1067,7 +1075,7 @@
             }
         }
 
-        // Fungsi pengambil suara AI Gemini TTS (mengembalikan objek AudioBuffer mentah)
+        // Fungsi pengambil suara AI Gemini TTS
         async function fetchGeminiTtsData(text, character) {
             const cacheKey = `${character}:${text}`;
             if (ttsAudioCache[cacheKey]) return ttsAudioCache[cacheKey];
@@ -1113,12 +1121,17 @@
                         const audioData = audioPart?.inlineData?.data;
                         const mimeType = audioPart?.inlineData?.mimeType || "audio/L16;rate=24000";
 
-                        if (!audioData) throw new Error('Audio data kosong');
+                        if (!audioData) throw new Error('Audio data kosong dari AI');
 
                         const rateMatch = mimeType.match(/rate=(\d+)/);
                         const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+                        
                         const pcmBuffer = base64ToArrayBuffer(audioData);
-                        const pcm16 = new Int16Array(pcmBuffer);
+                        
+                        // SANGAT PENTING: Pastikan byteLength genap. 
+                        // Jika ganjil (bug konversi di HP), sistem Int16Array akan seketika CRASH!
+                        const validLength = pcmBuffer.byteLength - (pcmBuffer.byteLength % 2);
+                        const pcm16 = new Int16Array(pcmBuffer, 0, validLength / 2);
 
                         // Konversi PCM16 ke Float32 untuk Web Audio API
                         const float32 = new Float32Array(pcm16.length);
@@ -1150,7 +1163,7 @@
         }
 
         async function speakText(text) {
-            initTtsAudioCtx(); // Panggil segera saat diklik agar Web Audio API aktif
+            initTtsAudioCtx(); // Panggil segera saat diklik agar HP mengizinkan pemutaran
             stopActiveSpeech();
             const myRequestId = ++activeRequestId;
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
@@ -1173,8 +1186,9 @@
                 setTtsStatus(false);
 
                 // Buat dan putar AudioBuffer menggunakan Web Audio API
-                // Cara ini 100% bebas dari pemblokiran autoplay di Safari iOS / Chrome Android!
-                const buffer = ttsAudioCtx.createBuffer(1, audioObj.pcmFloat32.length, audioObj.sampleRate);
+                // Amankan sampleRate agar selalu di batas spesifikasi wajib W3C (8000 - 96000)
+                const safeSampleRate = Math.max(8000, Math.min(96000, audioObj.sampleRate));
+                const buffer = ttsAudioCtx.createBuffer(1, audioObj.pcmFloat32.length, safeSampleRate);
                 buffer.getChannelData(0).set(audioObj.pcmFloat32);
 
                 currentTtsSource = ttsAudioCtx.createBufferSource();
@@ -1184,12 +1198,13 @@
 
             } catch (err) {
                 if (myRequestId !== activeRequestId) return;
+                console.error("AI Audio Error:", err);
                 setTtsStatus(true, '⚠️ Gagal memuat suara. Pastikan internet stabil dan coba lagi.', true);
                 setTimeout(() => setTtsStatus(false), 4000);
             }
         }
 
-        // Preload otomatis kalimat penjelasan di latar belakang agar saat dibuka di HP langsung berbunyi tanpa loading!
+        // Preload otomatis kalimat penjelasan di latar belakang
         const MAIN_PROMPTS_TO_PRELOAD = [
             'Ide pokok adalah kepala kereta atau bos cerita yang menarik semua kalimat lain. Sedangkan ide pendukung adalah gerbong di belakangnya yang menceritakan rinciannya!',
             'Ada tiga jenis paragraf. Paragraf Deduktif ide pokoknya di depan atau awal. Paragraf Induktif ide pokoknya di akhir. Dan paragraf campuran ide pokoknya ada di awal dan diulang di akhir.',
@@ -1205,7 +1220,7 @@
             // Muat kalimat pertama & kedua terlebih dahulu (Tab 1 yang langsung dilihat anak)
             for (let i = 0; i < 2; i++) {
                 try {
-                    await fetchGeminiTtsWavUrl(MAIN_PROMPTS_TO_PRELOAD[i], character);
+                    await fetchGeminiTtsData(MAIN_PROMPTS_TO_PRELOAD[i], character);
                 } catch (e) {}
             }
             if (badge) badge.textContent = '✨ AI Siap!';
