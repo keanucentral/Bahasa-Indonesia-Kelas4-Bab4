@@ -997,23 +997,55 @@
 
         // ==================== FITUR SUARA AI (GEMINI TTS + FALLBACK WEB SPEECH) ====================
         let selectedVoiceCharacter = 'child'; // 'child' (Anak) atau 'woman' (Wanita)
-        let currentAudioPlayer = null;
-        const ttsAudioCache = {}; // Menyimpan hasil suara agar tidak perlu memuat ulang
+        let currentAudioSource = null;
+        let ttsAudioCtx = null;
+        const ttsAudioCache = {}; // Menyimpan hasil buffer suara agar tidak perlu memuat ulang
+
+        // Membuka kunci AudioContext saat pengguna pertama kali menyentuh layar HP
+        function unlockMobileAudio() {
+            if (!ttsAudioCtx) {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                ttsAudioCtx = new AudioCtx();
+            }
+            if (ttsAudioCtx.state === 'suspended') {
+                ttsAudioCtx.resume();
+            }
+            // Mainkan buffer hening 1 sampel agar iOS/Android mengizinkan audio setelah proses fetch API
+            try {
+                const silentBuffer = ttsAudioCtx.createBuffer(1, 1, 22050);
+                const source = ttsAudioCtx.createBufferSource();
+                source.buffer = silentBuffer;
+                source.connect(ttsAudioCtx.destination);
+                source.start(0);
+            } catch (e) {}
+        }
+
+        // Pasang pendengar sentuhan pertama di layar smartphone
+        document.addEventListener('touchstart', unlockMobileAudio, { once: true });
+        document.addEventListener('click', unlockMobileAudio, { once: true });
+
+        function stopActiveSpeech() {
+            if (currentAudioSource) {
+                try {
+                    currentAudioSource.stop();
+                    currentAudioSource.disconnect();
+                } catch (e) {}
+                currentAudioSource = null;
+            }
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+            }
+        }
 
         function changeVoiceCharacter(val) {
+            unlockMobileAudio();
             playClickSound();
             selectedVoiceCharacter = val;
             const avatarEl = document.getElementById('voice-avatar');
             if (avatarEl) {
                 avatarEl.textContent = val === 'child' ? '👧' : '👩‍🏫';
             }
-            if (currentAudioPlayer) {
-                currentAudioPlayer.pause();
-                currentAudioPlayer = null;
-            }
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
+            stopActiveSpeech();
         }
 
         function base64ToArrayBuffer(base64) {
@@ -1026,32 +1058,27 @@
             return bytes.buffer;
         }
 
-        function pcmToWav(pcm16, sampleRate) {
-            const buffer = new ArrayBuffer(44 + pcm16.length * 2);
-            const view = new DataView(buffer);
-            const writeString = (offset, str) => {
-                for (let i = 0; i < str.length; i++) {
-                    view.setUint8(offset + i, str.charCodeAt(i));
+        // Konversi langsung PCM16 dari Gemini TTS ke AudioBuffer (Web Audio API)
+        function playPcm16Buffer(pcm16, sampleRate) {
+            unlockMobileAudio();
+            stopActiveSpeech();
+
+            const audioBuffer = ttsAudioCtx.createBuffer(1, pcm16.length, sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+            for (let i = 0; i < pcm16.length; i++) {
+                channelData[i] = pcm16[i] / 32768.0;
+            }
+
+            const source = ttsAudioCtx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(ttsAudioCtx.destination);
+            source.onended = () => {
+                if (currentAudioSource === source) {
+                    currentAudioSource = null;
                 }
             };
-            writeString(0, 'RIFF');
-            view.setUint32(4, 36 + pcm16.length * 2, true);
-            writeString(8, 'WAVE');
-            writeString(12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, 1, true); // PCM format
-            view.setUint16(22, 1, true); // Mono
-            view.setUint32(24, sampleRate, true);
-            view.setUint32(28, sampleRate * 2, true);
-            view.setUint16(32, 2, true);
-            view.setUint16(34, 16, true);
-            writeString(36, 'data');
-            view.setUint32(40, pcm16.length * 2, true);
-            let offset = 44;
-            for (let i = 0; i < pcm16.length; i++, offset += 2) {
-                view.setInt16(offset, pcm16[i], true);
-            }
-            return new Blob([buffer], { type: 'audio/wav' });
+            currentAudioSource = source;
+            source.start(0);
         }
 
         function setTtsStatus(visible, message = '') {
@@ -1066,13 +1093,11 @@
             }
         }
 
+        // Cadangan terakhir jika sedang offline: menggunakan pitch Web Audio atau Web Speech
         function fallbackBrowserSpeech(text, attempt = 0) {
             if (!('speechSynthesis' in window)) return;
             
             const voices = window.speechSynthesis.getVoices();
-            
-            // Perbaikan untuk Mobile: Browser di HP sering terlambat memuat daftar suara.
-            // Kita tunggu hingga suaranya tersedia (maksimal coba 10 kali / 2 detik).
             if (voices.length === 0 && attempt < 10) {
                 setTimeout(() => fallbackBrowserSpeech(text, attempt + 1), 200);
                 return;
@@ -1082,7 +1107,6 @@
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.lang = 'id-ID';
             
-            // Pencarian suara yang lebih luas untuk iOS (Damayanti) dan Android (Google)
             const idVoice = voices.find(v => v.lang.replace('_', '-').toLowerCase().includes('id') && 
                             (v.name.toLowerCase().includes('female') || 
                              v.name.toLowerCase().includes('gadis') || 
@@ -1093,10 +1117,10 @@
             if (idVoice) utterance.voice = idVoice;
 
             if (selectedVoiceCharacter === 'child') {
-                utterance.pitch = 1.6; // Nada lebih tinggi agar terdengar seperti anak kecil
+                utterance.pitch = 1.5;
                 utterance.rate = 1.05;
             } else {
-                utterance.pitch = 1.1; // Nada wanita dewasa yang ramah
+                utterance.pitch = 1.1;
                 utterance.rate = 0.95;
             }
             
@@ -1104,31 +1128,24 @@
         }
 
         async function speakText(text) {
+            // PENTING UNTUK SMARTPHONE: Buka kunci AudioContext tepat saat tombol ditekan (sebelum await fetch)
+            unlockMobileAudio();
             playClickSound();
-            // Hentikan audio sebelumnya jika sedang berjalan
-            if (currentAudioPlayer) {
-                currentAudioPlayer.pause();
-            } else {
-                currentAudioPlayer = new Audio(); // Inisialisasi awal untuk menghindari pemblokiran di Mobile
-            }
-            
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-            }
+            stopActiveSpeech();
 
             const cacheKey = `${selectedVoiceCharacter}:${text}`;
             if (ttsAudioCache[cacheKey]) {
-                currentAudioPlayer.src = ttsAudioCache[cacheKey];
-                currentAudioPlayer.play().catch(() => fallbackBrowserSpeech(text));
+                const cached = ttsAudioCache[cacheKey];
+                playPcm16Buffer(cached.pcm16, cached.sampleRate);
                 return;
             }
 
             // Konfigurasi suara Gemini TTS berdasarkan pilihan karakter
             const isChild = selectedVoiceCharacter === 'child';
-            const voiceName = isChild ? 'Leda' : 'Aoede'; // Leda = Youthful (Anak/Remaja ceria), Aoede = Wanita lembut
+            const voiceName = isChild ? 'Leda' : 'Aoede'; // Leda = Suara Anak/Remaja ceria, Aoede = Suara Wanita lembut
             const stylePrompt = isChild
-                ? `Ucapkan dalam Bahasa Indonesia dengan suara anak perempuan sekolah dasar yang ceria, imut, antusias, dan bersahabat: "${text}"`
-                : `Ucapkan dalam Bahasa Indonesia dengan suara wanita dewasa (Ibu Guru) yang lembut, keibuan, jelas, dan ramah: "${text}"`;
+                ? `Ucapkan kalimat berikut dalam Bahasa Indonesia dengan suara anak perempuan kecil yang ceria, imut, dan bersemangat: ${text}`
+                : `Ucapkan kalimat berikut dalam Bahasa Indonesia dengan suara Ibu Guru wanita dewasa yang lembut, ramah, dan jelas: ${text}`;
 
             const statusLabel = isChild ? '👧 Menyiapkan suara Teman Cilik AI...' : '👩‍🏫 Menyiapkan suara Ibu Guru AI...';
             setTtsStatus(true, statusLabel);
@@ -1175,22 +1192,18 @@
                     const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
                     const pcmData = base64ToArrayBuffer(audioData);
                     const pcm16 = new Int16Array(pcmData);
-                    const wavBlob = pcmToWav(pcm16, sampleRate);
-                    const audioUrl = URL.createObjectURL(wavBlob);
 
-                    ttsAudioCache[cacheKey] = audioUrl;
+                    // Simpan ke cache dalam bentuk PCM16 agar ringan & bisa langsung diputar ulang
+                    ttsAudioCache[cacheKey] = { pcm16, sampleRate };
                     setTtsStatus(false);
-                    currentAudioPlayer.src = audioUrl;
-                    currentAudioPlayer.play().catch((err) => {
-                        // Jika mobile browser memblokir audio (karena policy autoplay), gunakan suara cadangan
-                        fallbackBrowserSpeech(text);
-                    });
+
+                    // Putar menggunakan Web Audio API yang sudah di-unlock saat tombol diklik
+                    playPcm16Buffer(pcm16, sampleRate);
                 } else {
                     throw new Error('Invalid audio format');
                 }
             } catch (err) {
                 setTtsStatus(false);
-                // Jika koneksi ke AI TTS gagal, otomatis gunakan suara browser yang sudah diatur nada anak/wanita
                 fallbackBrowserSpeech(text);
             }
         }
